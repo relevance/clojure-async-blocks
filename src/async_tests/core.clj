@@ -141,6 +141,75 @@
                   (range (count parted))))]
      (last body-ids))))
 
+(defmethod sexpr-to-ssa 'loop*
+  [[_ locals & body]]
+  (let [parted (partition 2 locals)
+        syms (map first parted)
+        inits (map second parted)]
+    (gen-plan
+     [local-ids (all (map item-to-ssa inits))
+      body-blk (add-block)
+      final-blk (add-block)
+      _ (add-instruction :jmp nil body-blk)
+
+      _ (set-block body-blk)
+      _ (push-alter-binding :locals merge (debug  (zipmap (debug syms) (debug local-ids))))
+      _ (push-binding :recur-point body-blk)
+      _ (push-binding :recur-nodes local-ids)
+
+      body-ids (all (map item-to-ssa body))
+
+      _ (pop-binding :recur-nodes)
+      _ (pop-binding :recur-point)
+      _ (pop-binding :locals)
+      _ (add-instruction :jmp (last body-ids) final-blk)
+
+      _ (set-block final-blk)
+      ret-id (add-instruction :let ::value)]
+     ret-id)))
+
+(defmethod sexpr-to-ssa 'recur
+  [[_ & vals]]
+  (gen-plan
+   [val-ids (all (map item-to-ssa vals))
+    recurs (get-binding :recur-nodes)
+    _ (all (map (partial add-instruction :set)
+                recurs
+                val-ids))
+    recur-point (get-binding :recur-point)
+    
+    _ (add-instruction :jmp nil recur-point)]
+   nil))
+
+(defmethod sexpr-to-ssa 'if
+  [[_ test then else]]
+  (gen-plan
+   [test-id (item-to-ssa test)
+    then-blk (add-block)
+    else-blk (add-block)
+    final-blk (add-block)
+    _ (add-instruction :condbr test-id then-blk else-blk)
+    
+    _ (set-block then-blk)
+    then-id (item-to-ssa then)
+    _ (if then-id
+        (gen-plan
+         [_ (add-instruction :jmp then-id final-blk)]
+         then-id)
+        (no-op))
+
+    _ (set-block else-blk)
+    else-id (item-to-ssa else)
+    _ (if else-id
+        (gen-plan
+         [_ (add-instruction :jmp else-id final-blk)]
+         then-id)
+        (no-op))
+
+    _ (set-block final-blk)
+    val-id (add-instruction :let ::value)]
+   val-id))
+
 (defmethod sexpr-to-ssa 'yield
   [[_ expr]]
   (gen-plan
@@ -202,20 +271,39 @@
     :return
     `(assoc ~state-sym
        ::value ~(first args)
-       ::state ::finished)))
+       ::state ::finished)
+    :condbr
+    (let [[test-val then-blk else-blk] args]
+         `(if ~test-val
+            (recur (assoc ~state-sym ::state ~(keyword then-blk)  ::value ~test-val))
+            (recur (assoc ~state-sym ::state ~(keyword else-blk) ::value ~test-val))))
+    :jmp
+    (let [[val blk] args]
+      `(recur (assoc ~state-sym ::state ~(keyword blk) ::value ~val)))))
+
+(defn- interpret-arg [state-sym x]
+  (if (= x ::value)
+    `(::value ~state-sym)
+    x))
 
 (defn- build-block-body [state-sym blk]
   (mapcat
    (fn [inst]
      (case (:type inst)
        :let
-       `(~(:id inst) ~(first (:args inst)))
+       `(~(:id inst) ~(interpret-arg state-sym (first (:args inst))))
+       :set
+       `(~(first (:args inst)) ~(second (:args inst))
+         ~(:id inst) nil)
        :call
        `(~(:id inst) ~(seq (:args inst)))))
    (butlast blk)))
 
 (defn- build-new-state [state-sym blk]
-  (let [results (map :id (butlast blk))
+  (let [results (concat (map :id (butlast blk))
+                        (->> blk
+                             (filter (comp (partial = :set) :type))
+                             (map (comp first :args))))
         results (interleave (map keyword results) results)]
     (if-not (empty? results)
       `(assoc ~state-sym ~@results)
@@ -224,6 +312,7 @@
 (defn- emit-state-machine [machine]
   (let [state-sym (gensym "state_")]
     `(fn [~state-sym]
+       (pprint ~state-sym)
        (case (::state ~state-sym)
          nil
          (recur (assoc ~state-sym ::state ~(keyword (:start-block machine))))
@@ -242,12 +331,39 @@
       emit-state-machine
       debug))
 
+(defn state-machine-seq
+  ([f]
+     (state-machine-seq f (f {})))
+  ([f state]
+      (if (= (::state state) ::finished)
+        (cons (::value state) nil)
+        (cons (::value state)
+              (lazy-seq
+               (state-machine-seq f (f state)))))))
+
 (defn -main []
-  (let [x (state-machine (let* [x (inc (yield 1))
-                                y (yield 1)]
-                               (+ x y)))]
-    (debug x)
-    (debug (x {}))))
+  #_(assert (= (-> (state-machine (let* [x (inc (yield 1))
+                                       y (yield 1)]
+                                      (+ x y)))
+                 state-machine-seq
+                 doall
+                 debug)
+             [1 1 3]))
+  #_(assert (= (-> (state-machine (if (yield false)
+                                  (yield true)
+                                  (yield false)))
+                 state-machine-seq
+                 doall
+                 debug)))
+  
+  (assert (= (-> (state-machine (loop* [x (inc 0)]
+                                       (if (< x 10)
+                                         (recur (inc (yield x)))
+                                         x)))
+                 state-machine-seq
+                 doall
+                 debug)))
+  )
 
 
 
