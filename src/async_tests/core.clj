@@ -1,7 +1,8 @@
 (ns async-tests.core
   (:require [clojure.test :refer :all]
             [clojure.pprint :refer [pprint]]
-            [clojure.tools.namespace.repl :refer [refresh]]))
+            [clojure.tools.namespace.repl :refer [refresh]]
+            [no.disassemble :refer [disassemble]]))
 
 
 ;; State monad stuff, used only in SSA construction
@@ -355,36 +356,36 @@
 
 (defn -main []
   #_(assert (= (-> (state-machine (let* [x (inc (yield 1))
-                                       y (yield 1)]
-                                      (+ x y)))
-                 state-machine-seq
-                 doall
-                 debug)
-             [1 1 3]))
+                                         y (yield 1)]
+                                        (+ x y)))
+                   state-machine-seq
+                   doall
+                   debug)
+               [1 1 3]))
   #_(assert (= (-> (state-machine (if (yield false)
-                                  (yield true)
-                                  (yield false)))
-                 state-machine-seq
-                 doall
-                 debug)))
+                                    (yield true)
+                                    (yield false)))
+                   state-machine-seq
+                   doall
+                   debug)))
   
   #_(assert (= (-> (state-machine (loop [x 0]
-                                       (if (< x 10)
-                                         (recur (inc (yield x)))
-                                         x)))
-                 state-machine-seq
-                 doall
-                 debug)))
+                                    (if (< x 10)
+                                      (recur (inc (yield x)))
+                                      x)))
+                   state-machine-seq
+                   doall
+                   debug)))
 
   (assert (= (->> (state-machine (do (yield 1)
-                                    (yield 1)
-                                    (loop [x2 1
-                                           x1 1]
-                                      (recur x1 (yield (+ x1 x2))))))
-                 state-machine-seq
-                 (take 20)
-                 doall
-                 debug)))
+                                     (yield 1)
+                                     (loop [x2 1
+                                            x1 1]
+                                       (recur x1 (yield (+ x1 x2))))))
+                  state-machine-seq
+                  (take 32)
+                  doall
+                  debug)))
 
   
   )
