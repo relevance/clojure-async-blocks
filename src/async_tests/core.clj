@@ -82,7 +82,7 @@
     [(:current-block plan) plan]))
 
 (defn add-block []
-  (let [blk-sym (gensym "blk_")]
+  (let [blk-sym (keyword (gensym "blk_"))]
     (gen-plan
      [cur-blk (get-block)
       _ (assoc-in-plan [:blocks blk-sym] [])
@@ -91,16 +91,81 @@
           (no-op))]
      blk-sym)))
 
-(defn add-instruction [inst & args]
-  (let [inst-id (with-meta (gensym "inst_")
-                  {::instruction true})
-        inst {:type inst
-              :args args
-              :id inst-id}]
+(defn add-instruction [inst]
+  (pprint inst)
+  (let [inst-id (gensym "inst_")
+        inst (assoc inst :id inst-id)]
     (gen-plan
      [blk-id (get-block)
       _ (update-in-plan [:blocks blk-id] (fnil conj []) inst)]
      inst-id)))
+
+;;
+
+;; We're going to reduce Clojure expressions to a "bytecode" format,
+;; and then translate those bytecodes back into Clojure data. Here we
+;; define the bytecodes:
+
+(defprotocol IInstruction
+  (instruction-references [this] "Returns all the instruction ids referenced by this instruction")
+  (block-references [this] "Returns all the blocks this instruction references")
+  (emit-instruction [this state-sym] "Returns the clojure code that this instruction represents"))
+
+(defrecord Const [value]
+  IInstruction
+  (instruction-references [this] [])
+  (block-references [this] [])
+  (emit-instruction [this state-sym]
+    (if (= value ::value)
+      `[~(:id this) (::value ~state-sym)]
+      `[~(:id this) ~value])))
+
+(defrecord Set [id value]
+  IInstruction
+  (instruction-references [this] [value])
+  (block-references [this] [])
+  (emit-instruction [this state-sym]
+    `[~id ~value]))
+
+(defrecord Call [refs]
+  IInstruction
+  (instruction-references [this] refs)
+  (block-references [this] [])
+  (emit-instruction [this state-sym]
+    `[~(:id this) ~(seq refs)]))
+
+(defrecord Jmp [value block]
+  IInstruction
+  (instruction-references [this] [value])
+  (block-references [this] [block])
+  (emit-instruction [this state-sym]
+    `(recur (assoc ~state-sym ::value ~value ::state ~block))))
+
+(defrecord Return [value]
+  IInstruction
+  (instruction-references [this] [value])
+  (block-references [this] [])
+  (emit-instruction [this state-sym]
+    `(assoc ~state-sym ::value ~value ::state ::finished)))
+
+(defrecord Await [value block]
+  IInstruction
+  (instruction-references [this] [value])
+  (block-references [this] [block])
+  (emit-instruction [this state-sym]
+    `(assoc ~state-sym ::value ~value ::state ~block)))
+
+(defrecord CondBr [test then-block else-block]
+  IInstruction
+  (instruction-references [this] [test])
+  (block-references [this] [then-block else-block])
+  (emit-instruction [this state-sym]
+    `(if ~test
+       (recur (assoc ~state-sym ::state ~then-block))
+       (recur (assoc ~state-sym ::state ~else-block)))))
+
+
+
 
 (defn debug [x]
   (pprint x)
@@ -118,6 +183,13 @@
 
 (defmulti sexpr-to-ssa first)
 
+(defmethod sexpr-to-ssa :default
+  [args]
+  (gen-plan
+   [args-ids (all (map item-to-ssa args))
+    inst-id (add-instruction (->Call args-ids))]
+   inst-id))
+
 (defn let-binding-to-ssa
   [[sym bind]]
   (println sym bind)
@@ -125,14 +197,6 @@
    [bind-id (item-to-ssa bind)
     _ (push-alter-binding :locals assoc sym bind-id)]
    bind-id))
-
-(defmethod sexpr-to-ssa :default
-  [args]
-  (gen-plan
-   [args-ids (all (map item-to-ssa args))
-    inst-id (apply add-instruction :call
-                             args-ids)]
-   inst-id))
 
 (defmethod sexpr-to-ssa 'let*
   [[_ binds & body]]
@@ -154,7 +218,7 @@
      [local-ids (all (map item-to-ssa inits))
       body-blk (add-block)
       final-blk (add-block)
-      _ (add-instruction :jmp nil body-blk)
+      _ (add-instruction (->Jmp (last local-ids) body-blk))
 
       _ (set-block body-blk)
       _ (push-alter-binding :locals merge (debug  (zipmap (debug syms) (debug local-ids))))
@@ -167,11 +231,11 @@
       _ (pop-binding :recur-point)
       _ (pop-binding :locals)
       _ (if (last body-ids)
-          (add-instruction :jmp (last body-ids) final-blk)
+          (add-instruction (->Jmp (last body-ids) final-blk))
           (no-op))
 
       _ (set-block final-blk)
-      ret-id (add-instruction :let ::value)]
+      ret-id (add-instruction (->Const ::value))]
      ret-id)))
 
 (defmethod sexpr-to-ssa 'do
@@ -185,12 +249,12 @@
   (gen-plan
    [val-ids (all (map item-to-ssa vals))
     recurs (get-binding :recur-nodes)
-    _ (all (map (partial add-instruction :set)
+    _ (all (map #(add-instruction (->Set %1 %2))
                 recurs
                 val-ids))
     recur-point (get-binding :recur-point)
     
-    _ (add-instruction :jmp nil recur-point)]
+    _ (add-instruction (->Jmp nil recur-point))]
    nil))
 
 (defmethod sexpr-to-ssa 'if
@@ -200,13 +264,13 @@
     then-blk (add-block)
     else-blk (add-block)
     final-blk (add-block)
-    _ (add-instruction :condbr test-id then-blk else-blk)
+    _ (add-instruction (->CondBr test-id then-blk else-blk))
     
     _ (set-block then-blk)
     then-id (item-to-ssa then)
     _ (if then-id
         (gen-plan
-         [_ (add-instruction :jmp then-id final-blk)]
+         [_ (add-instruction (->Jmp then-id final-blk))]
          then-id)
         (no-op))
 
@@ -214,12 +278,12 @@
     else-id (item-to-ssa else)
     _ (if else-id
         (gen-plan
-         [_ (add-instruction :jmp else-id final-blk)]
+         [_ (add-instruction (->Jmp else-id final-blk))]
          then-id)
         (no-op))
 
     _ (set-block final-blk)
-    val-id (add-instruction :let ::value)]
+    val-id (add-instruction (->Const ::value))]
    val-id))
 
 (defmethod sexpr-to-ssa 'yield
@@ -227,9 +291,9 @@
   (gen-plan
    [next-blk (add-block)
     expr-id (item-to-ssa expr)
-    jmp-id (add-instruction :yield expr-id next-blk)
+    jmp-id (add-instruction (->Await expr-id next-blk))
     _ (set-block next-blk)
-    val-id (add-instruction :let ::value)]
+    val-id (add-instruction (->Const ::value))]
    val-id))
 
 (defmethod -item-to-ssa :list
@@ -239,77 +303,41 @@
 (defmethod -item-to-ssa :default
   [x]
   (gen-plan
-   [itm-id (add-instruction :let x)]
+   [itm-id (add-instruction (->Const x))]
    itm-id))
 
 (defmethod -item-to-ssa :symbol
   [x]
   (gen-plan
-   [locals (get-binding :locals)]
-   (do (println "locals" locals)
-       (pprint locals)
-       (if (contains? locals x)
-         (locals x)
-         x))))
+   [locals (get-binding :locals)
+    inst-id (if (contains? locals x)
+              (fn [p]
+                [(locals x) p])
+              (add-instruction (->Const x)))]
+   inst-id))
 
 (defn parse-to-state-machine [body]
   (-> (gen-plan
        [blk (add-block)
         _ (set-block blk)
         ids (all (map item-to-ssa body))
-        term-id (add-instruction :return (last ids))]
+        term-id (add-instruction (->Return (last ids)))]
        term-id)
       get-plan
       debug))
 
 
 (defn- build-block-preamble [state-sym blk]
-  (let [args (->> (mapcat :args blk)
-                  debug
-                  (filter symbol?)
-                  (filter (comp ::instruction meta))
+  (let [args (->> (mapcat instruction-references blk)
                   set
                   vec)]
     (if (empty? args)
       []
       `({:keys ~args} ~state-sym))))
 
-(defn- build-terminator [state-sym {:keys [type args] :as inst}]
-  #_(println type)
-  (case type
-    :yield
-    `(assoc ~state-sym
-       ::value ~(first args)
-       ::state ~(keyword (second args)))
-    :return
-    `(assoc ~state-sym
-       ::value ~(first args)
-       ::state ::finished)
-    :condbr
-    (let [[test-val then-blk else-blk] args]
-         `(if ~test-val
-            (recur (assoc ~state-sym ::state ~(keyword then-blk)  ::value ~test-val))
-            (recur (assoc ~state-sym ::state ~(keyword else-blk) ::value ~test-val))))
-    :jmp
-    (let [[val blk] args]
-      `(recur (assoc ~state-sym ::state ~(keyword blk) ::value ~val)))))
-
-(defn- interpret-arg [state-sym x]
-  (if (= x ::value)
-    `(::value ~state-sym)
-    x))
-
 (defn- build-block-body [state-sym blk]
   (mapcat
-   (fn [inst]
-     (case (:type inst)
-       :let
-       `(~(:id inst) ~(interpret-arg state-sym (first (:args inst))))
-       :set
-       `(~(first (:args inst)) ~(second (:args inst))
-         ~(:id inst) nil)
-       :call
-       `(~(:id inst) ~(seq (:args inst)))))
+   #(emit-instruction % state-sym)
    (butlast blk)))
 
 (defn- build-new-state [state-sym blk]
@@ -328,14 +356,14 @@
        #_(pprint ~state-sym)
        (case (::state ~state-sym)
          nil
-         (recur (assoc ~state-sym ::state ~(keyword (:start-block machine))))
+         (recur (assoc ~state-sym ::state ~(:start-block machine)))
          ~@(mapcat
             (fn [[id blk]]
               `(~(keyword id)
                 (let [~@(concat (build-block-preamble state-sym blk)
                                 (build-block-body state-sym blk))
                       ~state-sym ~(build-new-state state-sym blk)]
-                  ~(build-terminator state-sym (last blk)))))
+                  ~(emit-instruction (last blk) state-sym))))
             (:blocks machine))))))
 
 (defmacro state-machine [& body]
@@ -355,7 +383,7 @@
                (state-machine-seq f (f state)))))))
 
 (defn -main []
-  #_(assert (= (-> (state-machine (let* [x (inc (yield 1))
+  (assert (= (-> (state-machine (let* [x (inc (yield 1))
                                          y (yield 1)]
                                         (+ x y)))
                    state-machine-seq
@@ -377,7 +405,7 @@
                    doall
                    debug)))
 
-  (assert (= (->> (state-machine (do (yield 1)
+  #_(assert (= (->> (state-machine (do (yield 1)
                                      (yield 1)
                                      (loop [x2 1
                                             x1 1]
