@@ -105,12 +105,15 @@
   (pprint x)
   x)
 
-(defmulti item-to-ssa (fn [x]
+(defmulti -item-to-ssa (fn [x]
                         (println "item " x)
                         (debug (cond
                                 (symbol? x) :symbol
                                 (seq? x) :list
                                 :else :default))))
+
+(defn item-to-ssa [x]
+  (-item-to-ssa (macroexpand x)))
 
 (defmulti sexpr-to-ssa first)
 
@@ -162,11 +165,19 @@
       _ (pop-binding :recur-nodes)
       _ (pop-binding :recur-point)
       _ (pop-binding :locals)
-      _ (add-instruction :jmp (last body-ids) final-blk)
+      _ (if (last body-ids)
+          (add-instruction :jmp (last body-ids) final-blk)
+          (no-op))
 
       _ (set-block final-blk)
       ret-id (add-instruction :let ::value)]
      ret-id)))
+
+(defmethod sexpr-to-ssa 'do
+  [[_ & body]]
+  (gen-plan
+   [ids (all (map item-to-ssa body))]
+   (last ids)))
 
 (defmethod sexpr-to-ssa 'recur
   [[_ & vals]]
@@ -220,16 +231,17 @@
     val-id (add-instruction :let ::value)]
    val-id))
 
-(defmethod item-to-ssa :list
+(defmethod -item-to-ssa :list
   [lst]
   (sexpr-to-ssa lst))
 
-(defmethod item-to-ssa :default
+(defmethod -item-to-ssa :default
   [x]
-  (fn [plan]
-    [x plan]))
+  (gen-plan
+   [itm-id (add-instruction :let x)]
+   itm-id))
 
-(defmethod item-to-ssa :symbol
+(defmethod -item-to-ssa :symbol
   [x]
   (gen-plan
    [locals (get-binding :locals)]
@@ -262,7 +274,7 @@
       `({:keys ~args} ~state-sym))))
 
 (defn- build-terminator [state-sym {:keys [type args] :as inst}]
-  (println type)
+  #_(println type)
   (case type
     :yield
     `(assoc ~state-sym
@@ -312,7 +324,7 @@
 (defn- emit-state-machine [machine]
   (let [state-sym (gensym "state_")]
     `(fn [~state-sym]
-       (pprint ~state-sym)
+       #_(pprint ~state-sym)
        (case (::state ~state-sym)
          nil
          (recur (assoc ~state-sym ::state ~(keyword (:start-block machine))))
@@ -356,13 +368,25 @@
                  doall
                  debug)))
   
-  (assert (= (-> (state-machine (loop* [x (inc 0)]
+  #_(assert (= (-> (state-machine (loop [x 0]
                                        (if (< x 10)
                                          (recur (inc (yield x)))
                                          x)))
                  state-machine-seq
                  doall
                  debug)))
+
+  (assert (= (->> (state-machine (do (yield 1)
+                                    (yield 1)
+                                    (loop [x2 1
+                                           x1 1]
+                                      (recur x1 (yield (+ x1 x2))))))
+                 state-machine-seq
+                 (take 20)
+                 doall
+                 debug)))
+
+  
   )
 
 
