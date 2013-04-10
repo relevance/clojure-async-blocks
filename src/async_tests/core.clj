@@ -354,19 +354,23 @@
 
 (defn- emit-state-machine [machine]
   (let [state-sym (gensym "state_")]
-    `(fn [~state-sym]
-       (pprint ~state-sym)
-       (case (::state ~state-sym)
-         nil
-         (recur (assoc ~state-sym ::state ~(:start-block machine)))
-         ~@(mapcat
-            (fn [[id blk]]
-              `(~(keyword id)
-                (let [~@(concat (build-block-preamble state-sym blk)
-                                (build-block-body state-sym blk))
-                      ~state-sym ~(build-new-state state-sym blk)]
-                  ~(emit-instruction (last blk) state-sym))))
-            (:blocks machine))))))
+    `(let [bindings# (get-thread-bindings)]
+       (fn [~state-sym]
+         (pprint ~state-sym)
+         (case (::state ~state-sym)
+           nil
+           (recur (assoc ~state-sym
+                    ::state ~(:start-block machine)
+                    ::bindings bindings#))
+           ~@(mapcat
+              (fn [[id blk]]
+                `(~(keyword id)
+                  (with-bindings (::bindings ~state-sym)
+                    (let [~@(concat (build-block-preamble state-sym blk)
+                                    (build-block-body state-sym blk))
+                          ~state-sym ~(build-new-state state-sym blk)]
+                      ~(emit-instruction (last blk) state-sym)))))
+              (:blocks machine)))))))
 
 (defmacro state-machine [& body]
   (-> (parse-to-state-machine body)
@@ -399,7 +403,7 @@
                    doall
                    debug)))
   
-  (assert (= (-> (state-machine (loop [x 0]
+  #_(assert (= (-> (state-machine (loop [x 0]
                                     (if (< x 10)
                                       (recur (inc (yield x)))
                                       x)))
@@ -408,10 +412,20 @@
                    debug)))
 
   #_(assert (= (->> (state-machine (do (yield 1)
-                                     (yield 1)
-                                     (loop [x2 1
-                                            x1 1]
-                                       (recur x1 (yield (+ x1 x2))))))
+                                       (yield 1)
+                                       (loop [x2 1
+                                              x1 1]
+                                         (recur x1 (yield (+ x1 x2))))))
+                    state-machine-seq
+                    (take 32)
+                    doall
+                    debug)))
+
+  (def ^:dynamic temp 0)
+  (assert (= (->> (binding
+                      [temp 42]
+                    (state-machine (yield temp)
+                                   (yield temp)))
                   state-machine-seq
                   (take 32)
                   doall
@@ -419,9 +433,5 @@
 
   
   )
-
-
-
-
 
 
