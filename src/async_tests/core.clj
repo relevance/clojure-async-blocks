@@ -139,6 +139,16 @@
   (emit-instruction [this state-sym]
     `[~(:id this) ~(seq refs)]))
 
+(defrecord Fn [fn-expr local-names local-refs]
+  IInstruction
+  (reads-from [this] local-refs)
+  (writes-to [this] [(:id this)])
+  (block-references [this] [])
+  (emit-instruction [this state-sym]
+    `[~(:id this)
+      (let [~@(interleave local-names local-refs)]
+        ~@fn-expr)]))
+
 (defrecord Jmp [value block]
   IInstruction
   (reads-from [this] [value])
@@ -295,6 +305,15 @@
     val-id (add-instruction (->Const ::value))]
    val-id))
 
+(defmethod sexpr-to-ssa 'fn*
+  [& fn-expr]
+  ;; For fn expressions we just want to record the expression as well
+  ;; as a list of all known renamed locals
+  (gen-plan
+   [locals (get-binding :locals)
+    fn-id (add-instruction (->Fn fn-expr (keys locals) (vals locals)))]
+   fn-id))
+
 (defmethod sexpr-to-ssa 'yield
   [[_ expr]]
   (gen-plan
@@ -406,7 +425,7 @@
                    doall
                    debug)
                [1 1 3]))
-  (assert (= (-> (state-machine (if (yield false)
+  #_(assert (= (-> (state-machine (if (yield false)
                                     (yield true)
                                     (yield false)))
                    state-machine-seq
@@ -431,8 +450,21 @@
                     doall
                     debug)))
 
+  (assert (= (->> (state-machine (let [foo (yield 42)
+                                       bar (yield 43)
+                                       foo-fn (fn [] foo)
+                                       bar-fn (fn [] bar)]
+                                   (yield (foo-fn))
+                                   (yield (bar-fn))))
+                  debug
+                  
+                    state-machine-seq
+                    (take 32)
+                    doall
+                    debug)))
+
   (def ^:dynamic temp 0)
-  (assert (= (->> (binding
+  #_(assert (= (->> (binding
                       [temp 42]
                     (state-machine (yield temp)
                                    (yield temp)))
