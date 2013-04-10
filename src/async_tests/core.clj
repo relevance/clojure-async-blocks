@@ -120,12 +120,13 @@
       `[~(:id this) (::value ~state-sym)]
       `[~(:id this) ~value])))
 
-(defrecord Set [id value]
+(defrecord Set [set-id value]
   IInstruction
-  (instruction-references [this] [value])
+  (instruction-references [this] [set-id value])
   (block-references [this] [])
   (emit-instruction [this state-sym]
-    `[~id ~value]))
+    `[~set-id ~value
+      ~(:id this) nil]))
 
 (defrecord Call [refs]
   IInstruction
@@ -218,7 +219,7 @@
      [local-ids (all (map item-to-ssa inits))
       body-blk (add-block)
       final-blk (add-block)
-      _ (add-instruction (->Jmp (last local-ids) body-blk))
+      _ (add-instruction (->Jmp nil body-blk))
 
       _ (set-block body-blk)
       _ (push-alter-binding :locals merge (debug  (zipmap (debug syms) (debug local-ids))))
@@ -329,6 +330,7 @@
 
 (defn- build-block-preamble [state-sym blk]
   (let [args (->> (mapcat instruction-references blk)
+                  (filter symbol?)
                   set
                   vec)]
     (if (empty? args)
@@ -343,8 +345,8 @@
 (defn- build-new-state [state-sym blk]
   (let [results (concat (map :id (butlast blk))
                         (->> blk
-                             (filter (comp (partial = :set) :type))
-                             (map (comp first :args))))
+                             (filter (partial instance? Set))
+                             (map :set-id)))
         results (interleave (map keyword results) results)]
     (if-not (empty? results)
       `(assoc ~state-sym ~@results)
@@ -353,7 +355,7 @@
 (defn- emit-state-machine [machine]
   (let [state-sym (gensym "state_")]
     `(fn [~state-sym]
-       #_(pprint ~state-sym)
+       (pprint ~state-sym)
        (case (::state ~state-sym)
          nil
          (recur (assoc ~state-sym ::state ~(:start-block machine)))
@@ -383,7 +385,7 @@
                (state-machine-seq f (f state)))))))
 
 (defn -main []
-  (assert (= (-> (state-machine (let* [x (inc (yield 1))
+  #_(assert (= (-> (state-machine (let* [x (inc (yield 1))
                                          y (yield 1)]
                                         (+ x y)))
                    state-machine-seq
@@ -397,7 +399,7 @@
                    doall
                    debug)))
   
-  #_(assert (= (-> (state-machine (loop [x 0]
+  (assert (= (-> (state-machine (loop [x 0]
                                     (if (< x 10)
                                       (recur (inc (yield x)))
                                       x)))
