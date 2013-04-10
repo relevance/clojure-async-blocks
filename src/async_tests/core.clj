@@ -107,13 +107,15 @@
 ;; define the bytecodes:
 
 (defprotocol IInstruction
-  (instruction-references [this] "Returns all the instruction ids referenced by this instruction")
+  (reads-from [this] "Returns a list of instructions this instruction reads from")
+  (writes-to [this] "Returns a list of instructions this instruction writes to")
   (block-references [this] "Returns all the blocks this instruction references")
   (emit-instruction [this state-sym] "Returns the clojure code that this instruction represents"))
 
 (defrecord Const [value]
   IInstruction
-  (instruction-references [this] [])
+  (reads-from [this] [])
+  (writes-to [this] [(:id this)])
   (block-references [this] [])
   (emit-instruction [this state-sym]
     (if (= value ::value)
@@ -122,7 +124,8 @@
 
 (defrecord Set [set-id value]
   IInstruction
-  (instruction-references [this] [set-id value])
+  (reads-from [this] [value])
+  (writes-to [this] [set-id])
   (block-references [this] [])
   (emit-instruction [this state-sym]
     `[~set-id ~value
@@ -130,35 +133,40 @@
 
 (defrecord Call [refs]
   IInstruction
-  (instruction-references [this] refs)
+  (reads-from [this] refs)
+  (writes-to [this] [(:id this)])
   (block-references [this] [])
   (emit-instruction [this state-sym]
     `[~(:id this) ~(seq refs)]))
 
 (defrecord Jmp [value block]
   IInstruction
-  (instruction-references [this] [value])
+  (reads-from [this] [value])
+  (writes-to [this] [])
   (block-references [this] [block])
   (emit-instruction [this state-sym]
     `(recur (assoc ~state-sym ::value ~value ::state ~block))))
 
 (defrecord Return [value]
   IInstruction
-  (instruction-references [this] [value])
+  (reads-from [this] [value])
+  (writes-to [this] [])
   (block-references [this] [])
   (emit-instruction [this state-sym]
     `(assoc ~state-sym ::value ~value ::state ::finished)))
 
-(defrecord Await [value block]
+(defrecord Pause [value block]
   IInstruction
-  (instruction-references [this] [value])
+  (reads-from [this] [value])
+  (writes-to [this] [])
   (block-references [this] [block])
   (emit-instruction [this state-sym]
     `(assoc ~state-sym ::value ~value ::state ~block)))
 
 (defrecord CondBr [test then-block else-block]
   IInstruction
-  (instruction-references [this] [test])
+  (reads-from [this] [test])
+  (writes-to [this] [])
   (block-references [this] [then-block else-block])
   (emit-instruction [this state-sym]
     `(if ~test
@@ -292,7 +300,7 @@
   (gen-plan
    [next-blk (add-block)
     expr-id (item-to-ssa expr)
-    jmp-id (add-instruction (->Await expr-id next-blk))
+    jmp-id (add-instruction (->Pause expr-id next-blk))
     _ (set-block next-blk)
     val-id (add-instruction (->Const ::value))]
    val-id))
@@ -329,7 +337,7 @@
 
 
 (defn- build-block-preamble [state-sym blk]
-  (let [args (->> (mapcat instruction-references blk)
+  (let [args (->> (mapcat reads-from blk)
                   (filter symbol?)
                   set
                   vec)]
@@ -343,10 +351,10 @@
    (butlast blk)))
 
 (defn- build-new-state [state-sym blk]
-  (let [results (concat (map :id (butlast blk))
-                        (->> blk
-                             (filter (partial instance? Set))
-                             (map :set-id)))
+  (let [results (->> blk
+                     (mapcat writes-to)
+                     set
+                     vec)
         results (interleave (map keyword results) results)]
     (if-not (empty? results)
       `(assoc ~state-sym ~@results)
@@ -355,22 +363,24 @@
 (defn- emit-state-machine [machine]
   (let [state-sym (gensym "state_")]
     `(let [bindings# (get-thread-bindings)]
-       (fn [~state-sym]
-         (pprint ~state-sym)
-         (case (::state ~state-sym)
-           nil
-           (recur (assoc ~state-sym
-                    ::state ~(:start-block machine)
-                    ::bindings bindings#))
-           ~@(mapcat
-              (fn [[id blk]]
-                `(~(keyword id)
-                  (with-bindings (::bindings ~state-sym)
-                    (let [~@(concat (build-block-preamble state-sym blk)
-                                    (build-block-body state-sym blk))
-                          ~state-sym ~(build-new-state state-sym blk)]
-                      ~(emit-instruction (last blk) state-sym)))))
-              (:blocks machine)))))))
+       (fn state-machine#
+         ([]
+            (state-machine#
+             (assoc {}
+               ::state ~(:start-block machine)
+               ::bindings bindings#)))
+         ([~state-sym]
+            (with-bindings (::bindings ~state-sym)
+              (loop [~state-sym ~state-sym]
+                (case (::state ~state-sym)
+                  ~@(mapcat
+                     (fn [[id blk]]
+                       `(~(keyword id)
+                         (let [~@(concat (build-block-preamble state-sym blk)
+                                         (build-block-body state-sym blk))
+                               ~state-sym ~(build-new-state state-sym blk)]
+                           ~(emit-instruction (last blk) state-sym))))
+                     (:blocks machine))))))))))
 
 (defmacro state-machine [& body]
   (-> (parse-to-state-machine body)
@@ -380,7 +390,7 @@
 
 (defn state-machine-seq
   ([f]
-     (state-machine-seq f (f {})))
+     (state-machine-seq f (f)))
   ([f state]
       (if (= (::state state) ::finished)
         (cons (::value state) nil)
@@ -396,7 +406,7 @@
                    doall
                    debug)
                [1 1 3]))
-  #_(assert (= (-> (state-machine (if (yield false)
+  (assert (= (-> (state-machine (if (yield false)
                                     (yield true)
                                     (yield false)))
                    state-machine-seq
