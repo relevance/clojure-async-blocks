@@ -2,7 +2,15 @@
   (:require [clojure.test :refer :all]
             [clojure.pprint :refer [pprint]]
             [clojure.tools.namespace.repl :refer [refresh]]
-            [no.disassemble :refer [disassemble]]))
+            )
+  (:import [com.google.common.util.concurrent ListenableFuture MoreExecutors]
+           [java.util.concurrent Executors]))
+
+(def ^:dynamic *ambient-executor* (MoreExecutors/listeningDecorator (Executors/newFixedThreadPool 10)))
+
+(defn defer [value]
+  (let [^Callable f (fn [] value)]
+    (.submit *ambient-executor* f)))
 
 
 ;; State monad stuff, used only in SSA construction
@@ -401,30 +409,43 @@
                            ~(emit-instruction (last blk) state-sym))))
                      (:blocks machine))))))))))
 
+
+(defn finished?
+  "Returns true if the machine is in a finished state"
+  [state]
+  (= (::state state) ::finished))
+
+(defn runner-wrapper
+  "Simple wrapper that runs the state machine to completion"
+  [f]
+  (loop [state (f)]
+    (if (finished? state)
+      (::value state)
+      (recur (f state)))))
+
+(defn seq-wrapper
+  "State machine wrapper that returns a seq of values"
+  ([f]
+     (seq-wrapper f (f)))
+  ([f state]
+     (when-not (finished? state)
+       (cons (::value state)
+             (lazy-seq (seq-wrapper f (f state)))))))
+
 (defmacro state-machine [& body]
   (-> (parse-to-state-machine body)
       second
       emit-state-machine
       debug))
 
-(defn state-machine-seq
-  ([f]
-     (state-machine-seq f (f)))
-  ([f state]
-      (if (= (::state state) ::finished)
-        (cons (::value state) nil)
-        (cons (::value state)
-              (lazy-seq
-               (state-machine-seq f (f state)))))))
-
 (defn -main []
-  #_(assert (= (-> (state-machine (let* [x (inc (yield 1))
-                                         y (yield 1)]
-                                        (+ x y)))
-                   state-machine-seq
-                   doall
-                   debug)
-               [1 1 3]))
+  (-> (state-machine (let* [x (inc (yield 1))
+                            y (yield 1)]
+                           (yield (+ x y))))
+      runner-wrapper
+      #_doall
+      debug)
+  #_[1 1]
   #_(assert (= (-> (state-machine (if (yield false)
                                     (yield true)
                                     (yield false)))
@@ -450,7 +471,7 @@
                     doall
                     debug)))
 
-  (assert (= (->> (state-machine (let [foo (yield 42)
+  #_(assert (= (->> (state-machine (let [foo (yield 42)
                                        bar (yield 43)
                                        foo-fn (fn [] foo)
                                        bar-fn (fn [] bar)]
