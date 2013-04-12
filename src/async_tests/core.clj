@@ -2,18 +2,9 @@
   (:require [clojure.test :refer :all]
             [clojure.pprint :refer [pprint]]
             [clojure.tools.namespace.repl :refer [refresh]]
-            )
-  (:import [com.google.common.util.concurrent ListenableFuture MoreExecutors FutureCallback Futures]
-           [java.util.concurrent Executors]))
-
-(def ^:dynamic *ambient-executor* (MoreExecutors/listeningDecorator (Executors/newFixedThreadPool 10)))
+            [cljque.promises :as cqe]))
 
 (def ^:dynamic *symbol-translations* {})
-
-(defn defer [value]
-  (let [^Callable f (fn [] value)]
-    (.submit *ambient-executor* f)))
-
 
 ;; State monad stuff, used only in SSA construction
 
@@ -152,9 +143,11 @@
 
 ;;
 
-;; We're going to reduce Clojure expressions to a "bytecode" format,
-;; and then translate those bytecodes back into Clojure data. Here we
-;; define the bytecodes:
+;; We're going to reduce Clojure expressions to a ssa format,
+;; and then translate the instructions for this
+;; virtual-virtual-machine back into Clojure data.
+
+;; Here we define the instructions:
 
 (defprotocol IInstruction
   (reads-from [this] "Returns a list of instructions this instruction reads from")
@@ -239,6 +232,7 @@
   (pprint x)
   x)
 
+;; Dispatch clojure forms based on data type
 (defmulti -item-to-ssa (fn [x]
                          (cond
                           (symbol? x) :symbol
@@ -248,11 +242,14 @@
                           (vector? x) :vector
                           :else :default)))
 
+;; macroexpand forms before translation
 (defn item-to-ssa [x]
   (-item-to-ssa (macroexpand x)))
 
+;; given an sexpr, dispatch on the first item 
 (defmulti sexpr-to-ssa (fn [[x & _]]
                          (get *symbol-translations* x x)))
+
 
 (defmethod sexpr-to-ssa :default
   [args]
@@ -263,7 +260,6 @@
 
 (defn let-binding-to-ssa
   [[sym bind]]
-  (println sym bind)
   (gen-plan
    [bind-id (item-to-ssa bind)
     _ (push-alter-binding :locals assoc sym bind-id)]
@@ -530,23 +526,16 @@
        p))
   ([f p state]
      (let [value (::value state)]
-       (println value (finished? state))
+       (println value) ;; here while I debug this
        (cond
         (finished? state)
         (p value)
         
-        (instance? ListenableFuture value)
-        (Futures/addCallback value
-                             (reify
-                               FutureCallback
-                               (onSuccess [this result]
-                                 (println "result----> " result @value)
-                                 (task-wrapper f p (-> state
-                                                       (assoc ::value result)
-                                                       f)))
-                               (onFailure [this ex]
-                                 (println "failure!")))
-                             *ambient-executor*)
+        (extends? cqe/INotify (class value))
+        (cqe/then value result
+                  (task-wrapper f p (-> state
+                                        (assoc ::value result)
+                                        f)))
         
         (instance? clojure.lang.IDeref value)
         (recur f p (-> state
@@ -559,7 +548,7 @@
 (defn state-machine [body]
   (-> (parse-to-state-machine body)
       second
-      debug
+      #_debug
       emit-state-machine))
 
 (defmacro runner
@@ -604,12 +593,30 @@
     (is (= nil
            (runner (when (pause false)
                      (pause true))))))
+  
   (testing "loop expressions"
     (is (= 100
            (runner (loop [x 0]
                      (if (< x 100)
                        (recur (inc (pause x)))
                        (pause x)))))))
+  
+  (testing "let expressions"
+    (is (= 3
+           (runner (let [x 1 y 2]
+                     (+ x y))))))
+  
+  (testing "vector destructuring"
+    (is (= 3
+           (runner (let [[x y] [1 2]]
+                     (+ x y))))))
+
+  (testing "hash-map destructuring"
+    (is (= 3
+           (runner (let [{:keys [x y] x2 :x y2 :y :as foo} {:x 1 :y 2}]
+                     (assert (and foo (pause x) y x2 y2 foo))
+                     (+ x y))))))
+  
   (testing "hash-map literals"
     (is (= {:1 1 :2 2 :3 3}
            (runner {:1 (pause 1)
@@ -618,13 +625,22 @@
   (testing "hash-set literals"
     (is (= #{1 2 3}
            (runner #{(pause 1)
-                    (pause 2)
-                    (pause 3)}))))
+                     (pause 2)
+                     (pause 3)}))))
   (testing "vector literals"
     (is (= [1 2 3]
            (runner [(pause 1)
                     (pause 2)
                     (pause 3)]))))
+  
+  (testing "fn closures"
+    (is (= 42
+           (runner
+            (let [x 42
+                  _ (pause x)
+                  f (fn [] x)]
+              (f))))))
+  
   (testing "java interop"
     (is (= "1"
            (runner (pause (. (pause 1) toString)))))
@@ -637,89 +653,34 @@
            (take 12 (generator (yield 0)
                                (loop [x2 (yield 1)
                                       x1 (yield 1)]
-                                 (recur x1 (yield (+ x1 x2))))))))))
-
-(defn -main []
-  (run-tests)
-  (comment
-    #_(-> (state-machine (let* [x (inc (yield 1))
-                                y (yield 1)]
-                               (yield (+ x y))))
-          runner-wrapper
-          #_doall
-          debug)
-    #_[1 1]
-    #_(println (generator (if (yield false)
-                            (yield true)
-                            (yield false))))
-
-    (println (generator (loop [x 0]
-                          (if (< x 100)
-                            (recur (inc (yield x)))
-                            x))))
-    
-    #_(assert (= (-> 
-                  state-machine-seq
-                  doall
-                  debug)))
-
-    #_(assert (= (->> (state-machine (do (yield 1)
-                                         (yield 1)
-                                         (loop [x2 1
-                                                x1 1]
-                                           (recur x1 (yield (+ x1 x2))))))
-                      state-machine-seq
-                      (take 32)
-                      doall
-                      debug)))
-
-    #_(assert (= (->> (state-machine (let [foo (yield 42)
-                                           bar (yield 43)
-                                           foo-fn (fn [] foo)
-                                           bar-fn (fn [] bar)]
-                                       (yield (foo-fn))
-                                       (yield (bar-fn))))
-                      debug
-                      
-                      state-machine-seq
-                      (take 32)
-                      doall
-                      debug)))
-
-    (def ^:dynamic temp 0)
-    #_(assert (= (->> (binding
-                          [temp 42]
-                        (state-machine (yield temp)
-                                       (yield temp)))
-                      state-machine-seq
-                      (take 32)
-                      doall
-                      debug)))
-
-    #_(println @(async (do (println @(defer 42))
-                           (println @(defer 33)))))
-
-    (println )
-
-    (defn thread-id []
-      (.getId (Thread/currentThread)))
-    
-    #_(->> (async (do (println @(defer (thread-id)))
-                      (println @(defer (thread-id)))
-                      (println (yield (defer (thread-id))))
-                      (println (yield (defer (thread-id))))
-                      (println (yield (defer (thread-id))))
-                      
-                      ))
-           task-wrapper
-           debug
-           deref
-           debug)
+                                 (recur x1 (yield (+ x1 x2)))))))))
+  (testing "sequence ends"
+    (is (= [0 1 2]
+           (generator (yield 0)
+                      (yield 1)
+                      (yield 2)))))
+  (testing "doseq"
+    (is (= [0 1 2]
+           (generator
+            (doseq [x [0 1 2]]
+              (yield x)))))))
 
 
-    (.shutdownNow *ambient-executor*)
-  
-    
+(defn defer [value]
+  (cqe/future value))
 
 
-))
+
+(deftest async-test
+  (testing "values are returned correctly"
+    (is (= 10
+           @(async @(defer 10)))))
+  (testing "supports hash map literals"
+    (is (= {:a 42 :b 43}
+           @(async {:a @(defer 42)
+                    :b @(defer 43)}))))
+  (testing "supports atom derefs"
+    (is (= {:a 42 :b 43}
+           @(async {:a @(defer 42)
+                    :b @(atom 43)})))))
+
