@@ -178,8 +178,7 @@
   (writes-to [this] [set-id])
   (block-references [this] [])
   (emit-instruction [this state-sym]
-    `[~set-id ~value
-      ~(:id this) nil]))
+    `[~set-id ~value]))
 
 (defrecord Call [refs]
   IInstruction
@@ -241,17 +240,18 @@
   x)
 
 (defmulti -item-to-ssa (fn [x]
-                        (println "item " x)
-                        (debug (cond
-                                (symbol? x) :symbol
-                                (seq? x) :list
-                                :else :default))))
+                         (cond
+                          (symbol? x) :symbol
+                          (seq? x) :list
+                          (map? x) :map
+                          (set? x) :set
+                          (vector? x) :vector
+                          :else :default)))
 
 (defn item-to-ssa [x]
   (-item-to-ssa (macroexpand x)))
 
 (defmulti sexpr-to-ssa (fn [[x & _]]
-                         (println "x ->>>>>>>>>> " x *symbol-translations*)
                          (get *symbol-translations* x x)))
 
 (defmethod sexpr-to-ssa :default
@@ -293,7 +293,7 @@
       _ (add-instruction (->Jmp nil body-blk))
 
       _ (set-block body-blk)
-      _ (push-alter-binding :locals merge (debug  (zipmap (debug syms) (debug local-ids))))
+      _ (push-alter-binding :locals merge (zipmap syms local-ids))
       _ (push-binding :recur-point body-blk)
       _ (push-binding :recur-nodes local-ids)
 
@@ -302,7 +302,7 @@
       _ (pop-binding :recur-nodes)
       _ (pop-binding :recur-point)
       _ (pop-binding :locals)
-      _ (if (last body-ids)
+      _ (if (not= (last body-ids) ::terminated)
           (add-instruction (->Jmp (last body-ids) final-blk))
           (no-op))
 
@@ -327,7 +327,7 @@
     recur-point (get-binding :recur-point)
     
     _ (add-instruction (->Jmp nil recur-point))]
-   nil))
+   ::terminated))
 
 (defmethod sexpr-to-ssa 'if
   [[_ test then else]]
@@ -340,7 +340,7 @@
     
     _ (set-block then-blk)
     then-id (item-to-ssa then)
-    _ (if then-id
+    _ (if (not= then-id ::terminated)
         (gen-plan
          [_ (add-instruction (->Jmp then-id final-blk))]
          then-id)
@@ -348,7 +348,7 @@
 
     _ (set-block else-blk)
     else-id (item-to-ssa else)
-    _ (if else-id
+    _ (if (not= else-id ::terminated)
         (gen-plan
          [_ (add-instruction (->Jmp else-id final-blk))]
          then-id)
@@ -384,10 +384,7 @@
 (defmethod -item-to-ssa :default
   [x]
   (fn [plan]
-    [x plan])
-  #_(gen-plan
-   [itm-id (add-instruction (->Const x))]
-   itm-id))
+    [x plan]))
 
 (defmethod -item-to-ssa :symbol
   [x]
@@ -401,15 +398,29 @@
               #_(add-instruction (->Const x)))]
    inst-id))
 
-(defn parse-to-state-machine [body]
+(defmethod -item-to-ssa :map
+  [x]
+  (-item-to-ssa `(hash-map ~@(mapcat identity x))))
+
+(defmethod -item-to-ssa :vector
+  [x]
+  (-item-to-ssa `(vector ~@x)))
+
+(defmethod -item-to-ssa :set
+  [x]
+  (-item-to-ssa `(hash-set ~@x)))
+
+(defn parse-to-state-machine
+  "Takes an sexpr and returns a hashmap that describes the execution flow of the sexpr as
+   a series of SSA style blocks."
+  [body]
   (-> (gen-plan
        [blk (add-block)
         _ (set-block blk)
         ids (all (map item-to-ssa body))
         term-id (add-instruction (->Return (last ids)))]
        term-id)
-      get-plan
-      debug))
+      get-plan))
 
 
 (defn index-instruction [blk-id idx inst]
@@ -469,7 +480,6 @@
 (defn- emit-state-machine [machine]
   (let [index (index-state-machine machine)
         state-sym (gensym "state_")]
-    (pprint index)
     `(let [bindings# (get-thread-bindings)]
        (fn state-machine#
          ([]
@@ -549,95 +559,167 @@
 (defn state-machine [body]
   (-> (parse-to-state-machine body)
       second
-      emit-state-machine
-      debug))
+      debug
+      emit-state-machine))
+
+(defmacro runner
+  "Creates a runner block. The code inside the body of this macro will be translated
+  into a state machine. At run time the body will be run as normal. This transform is
+  only really useful for testing."
+  [& body]
+  (binding [*symbol-translations* '{pause async_tests/pause}]
+    `(runner-wrapper ~(state-machine body))))
 
 (defmacro async [& body]
   (binding [*symbol-translations* '{clojure.core/deref async_tests/pause}]
     `(task-wrapper ~(state-machine body))))
 
-(defmacro generator [& body]
+(defmacro generator
+  "Creates a lazy seq from the body of the macro. Each call to (yield x) inside the body of this
+   macro will create a new item in the output seq."
+  [& body]
   (binding [*symbol-translations* '{yield async_tests/pause}]
     `(seq-wrapper ~(state-machine body))))
 
+
+(deftest runner-tests
+  (testing "do blocks"
+    (is (= 42
+           (runner (do (pause 42)))))
+    (is (= 42
+           (runner (do (pause 44)
+                       (pause 42))))))
+  (testing "if expressions"
+    (is (= true
+           (runner (if (pause true)
+                     (pause true)
+                     (pause false)))))
+    (is (= false
+           (runner (if (pause false)
+                     (pause true)
+                     (pause false)))))
+    (is (= true
+           (runner (when (pause true)
+                     (pause true)))))
+    (is (= nil
+           (runner (when (pause false)
+                     (pause true))))))
+  (testing "loop expressions"
+    (is (= 100
+           (runner (loop [x 0]
+                     (if (< x 100)
+                       (recur (inc (pause x)))
+                       (pause x)))))))
+  (testing "hash-map literals"
+    (is (= {:1 1 :2 2 :3 3}
+           (runner {:1 (pause 1)
+                    :2 (pause 2)
+                    :3 (pause 3)}))))
+  (testing "hash-set literals"
+    (is (= #{1 2 3}
+           (runner #{(pause 1)
+                    (pause 2)
+                    (pause 3)}))))
+  (testing "vector literals"
+    (is (= [1 2 3]
+           (runner [(pause 1)
+                    (pause 2)
+                    (pause 3)]))))
+  (testing "java interop"
+    (is (= "1"
+           (runner (pause (. (pause 1) toString)))))
+    (is (= "1"
+           (runner (pause (.toString (pause 1))))))))
+
+(deftest generator-tests
+  (testing "fibonacci generator"
+    (is (= [0 1 1 2 3 5 8 13 21 34 55 89]
+           (take 12 (generator (yield 0)
+                               (loop [x2 (yield 1)
+                                      x1 (yield 1)]
+                                 (recur x1 (yield (+ x1 x2))))))))))
+
 (defn -main []
-  #_(-> (state-machine (let* [x (inc (yield 1))
-                              y (yield 1)]
-                             (yield (+ x y))))
-        runner-wrapper
-        #_doall
-        debug)
-  #_[1 1]
-  #_(println (generator (if (yield false)
-                        (yield true)
-                        (yield false))))
+  (run-tests)
+  (comment
+    #_(-> (state-machine (let* [x (inc (yield 1))
+                                y (yield 1)]
+                               (yield (+ x y))))
+          runner-wrapper
+          #_doall
+          debug)
+    #_[1 1]
+    #_(println (generator (if (yield false)
+                            (yield true)
+                            (yield false))))
 
-  (println (generator (loop [x 0]
-                        (if (< x 100)
-                          (recur (inc (yield x)))
-                          x))))
+    (println (generator (loop [x 0]
+                          (if (< x 100)
+                            (recur (inc (yield x)))
+                            x))))
+    
+    #_(assert (= (-> 
+                  state-machine-seq
+                  doall
+                  debug)))
+
+    #_(assert (= (->> (state-machine (do (yield 1)
+                                         (yield 1)
+                                         (loop [x2 1
+                                                x1 1]
+                                           (recur x1 (yield (+ x1 x2))))))
+                      state-machine-seq
+                      (take 32)
+                      doall
+                      debug)))
+
+    #_(assert (= (->> (state-machine (let [foo (yield 42)
+                                           bar (yield 43)
+                                           foo-fn (fn [] foo)
+                                           bar-fn (fn [] bar)]
+                                       (yield (foo-fn))
+                                       (yield (bar-fn))))
+                      debug
+                      
+                      state-machine-seq
+                      (take 32)
+                      doall
+                      debug)))
+
+    (def ^:dynamic temp 0)
+    #_(assert (= (->> (binding
+                          [temp 42]
+                        (state-machine (yield temp)
+                                       (yield temp)))
+                      state-machine-seq
+                      (take 32)
+                      doall
+                      debug)))
+
+    #_(println @(async (do (println @(defer 42))
+                           (println @(defer 33)))))
+
+    (println )
+
+    (defn thread-id []
+      (.getId (Thread/currentThread)))
+    
+    #_(->> (async (do (println @(defer (thread-id)))
+                      (println @(defer (thread-id)))
+                      (println (yield (defer (thread-id))))
+                      (println (yield (defer (thread-id))))
+                      (println (yield (defer (thread-id))))
+                      
+                      ))
+           task-wrapper
+           debug
+           deref
+           debug)
+
+
+    (.shutdownNow *ambient-executor*)
   
-  #_(assert (= (-> 
-                   state-machine-seq
-                   doall
-                   debug)))
-
-  #_(assert (= (->> (state-machine (do (yield 1)
-                                       (yield 1)
-                                       (loop [x2 1
-                                              x1 1]
-                                         (recur x1 (yield (+ x1 x2))))))
-                    state-machine-seq
-                    (take 32)
-                    doall
-                    debug)))
-
-  #_(assert (= (->> (state-machine (let [foo (yield 42)
-                                         bar (yield 43)
-                                         foo-fn (fn [] foo)
-                                         bar-fn (fn [] bar)]
-                                     (yield (foo-fn))
-                                     (yield (bar-fn))))
-                    debug
-                    
-                    state-machine-seq
-                    (take 32)
-                    doall
-                    debug)))
-
-  (def ^:dynamic temp 0)
-  #_(assert (= (->> (binding
-                        [temp 42]
-                      (state-machine (yield temp)
-                                     (yield temp)))
-                    state-machine-seq
-                    (take 32)
-                    doall
-                    debug)))
-
-  #_(println @(async (do (println @(defer 42))
-                       (println @(defer 33)))))
-
-  (println )
-
-  (defn thread-id []
-    (.getId (Thread/currentThread)))
-  
-  #_(->> (async (do (println @(defer (thread-id)))
-                    (println @(defer (thread-id)))
-                    (println (yield (defer (thread-id))))
-                    (println (yield (defer (thread-id))))
-                    (println (yield (defer (thread-id))))
-                    
-                    ))
-         task-wrapper
-         debug
-         deref
-         debug)
+    
 
 
-  (.shutdownNow *ambient-executor*)
-  
-  )
-
-
+))
