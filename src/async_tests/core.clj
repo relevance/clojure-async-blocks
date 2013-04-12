@@ -3,10 +3,12 @@
             [clojure.pprint :refer [pprint]]
             [clojure.tools.namespace.repl :refer [refresh]]
             )
-  (:import [com.google.common.util.concurrent ListenableFuture MoreExecutors]
+  (:import [com.google.common.util.concurrent ListenableFuture MoreExecutors FutureCallback Futures]
            [java.util.concurrent Executors]))
 
 (def ^:dynamic *ambient-executor* (MoreExecutors/listeningDecorator (Executors/newFixedThreadPool 10)))
+
+(def ^:dynamic *symbol-translations* {})
 
 (defn defer [value]
   (let [^Callable f (fn [] value)]
@@ -21,7 +23,14 @@
        (assert ~psym "Nill plan")
        ~body)))
 
-(defmacro gen-plan [binds id-expr]
+(defmacro gen-plan
+  "Allows a user to define a state monad binding plan.
+
+  (gen-plan
+    [_ (assoc-in-plan [:foo :bar] 42)
+     val (get-in-plan [:foo :bar])]
+    val)"
+  [binds id-expr]
   (let [binds (partition 2 binds)
         psym (gensym "plan_")
         f (reduce
@@ -33,33 +42,48 @@
     `(fn [~psym]
        ~f)))
 
-(defn get-plan [f]
+(defn get-plan
+  "Returns the final [id state] from a plan. "
+  [f]
   (f {}))
 
-(defn push-binding [key value]
+(defn push-binding
+  "Sets the binding 'key' to value. This operation can be undone via pop-bindings.
+   Bindings are stored in the state hashmap."
+  [key value]
   (fn [plan]
     [nil (update-in plan [:bindings key] conj value)]))
 
-(defn push-alter-binding [key f & args]
-  (println "args---->  " args)
+(defn push-alter-binding
+  "Pushes the result of (apply f old-value args) as current value of binding key"
+  [key f & args]
   (fn [plan]
     [nil (update-in plan [:bindings key]
                   #(conj % (apply f (first %) args)))]))
 
-(defn get-binding [key]
+(defn get-binding
+  "Gets the value of the current binding for key"
+  [key]
   (fn [plan]
     [(first (get-in plan [:bindings key])) plan]))
 
-(defn pop-binding [key]
+(defn pop-binding
+  "Removes the most recent binding for key"
+  [key]
   (fn [plan]
     [(first (get-in plan [:bindings key]))
      (update-in plan [:bindings key] pop)]))
 
-(defn no-op []
+(defn no-op
+  "This function can be used inside a gen-plan when no operation is to be performed"
+  []
   (fn [plan]
     [nil plan]))
 
-(defn all [itms]
+(defn all
+  "Assumes that itms is a list of state monad function results, threads the state map
+  through all of them. Returns a vector of all the results."
+  [itms]
   (fn [plan]
     (reduce
      (fn [[ids plan] f]
@@ -68,28 +92,40 @@
      [[] plan]
      itms)))
 
-(defn assoc-in-plan [path val]
+(defn assoc-in-plan
+  "Same as assoc-in, but for state hash map"
+  [path val]
   (fn [plan]
     [val (assoc-in plan path val)]))
 
-(defn update-in-plan [path f & args]
+(defn update-in-plan
+  "Same as update-in, but for a state hash map"
+  [path f & args]
   (fn [plan]
     [nil (apply update-in plan path f args)]))
 
-(defn get-in-plan [path]
+(defn get-in-plan
+  "Same as get-in, but for a state hash map"
+  [path]
   (fn [plan]
     [(get-in plan path) plan]))
 
 
-(defn set-block [block-id]
+(defn set-block
+  "Sets the current block being written to by the functions. The next add-instruction call will append to this block"
+  [block-id]
   (fn [plan]
     [block-id (assoc plan :current-block block-id)]))
 
-(defn get-block []
+(defn get-block
+  "Gets the current block"
+  []
   (fn [plan]
     [(:current-block plan) plan]))
 
-(defn add-block []
+(defn add-block
+  "Adds a new block, returns its id, but does not change the current block (does not call set-block)."
+  []
   (let [blk-sym (keyword (gensym "blk_"))]
     (gen-plan
      [cur-blk (get-block)
@@ -99,8 +135,9 @@
           (no-op))]
      blk-sym)))
 
-(defn add-instruction [inst]
-  (pprint inst)
+(defn add-instruction
+  "Appends an instruction to the current block. "
+  [inst]
   (let [inst-id (gensym "inst_")
         inst (assoc inst :id inst-id)]
     (gen-plan
@@ -208,7 +245,9 @@
 (defn item-to-ssa [x]
   (-item-to-ssa (macroexpand x)))
 
-(defmulti sexpr-to-ssa first)
+(defmulti sexpr-to-ssa (fn [[x & _]]
+                         (println "x ->>>>>>>>>> " x *symbol-translations*)
+                         (get *symbol-translations* x x)))
 
 (defmethod sexpr-to-ssa :default
   [args]
@@ -322,7 +361,7 @@
     fn-id (add-instruction (->Fn fn-expr (keys locals) (vals locals)))]
    fn-id))
 
-(defmethod sexpr-to-ssa 'yield
+(defmethod sexpr-to-ssa 'async_tests/pause
   [[_ expr]]
   (gen-plan
    [next-blk (add-block)
@@ -432,19 +471,56 @@
        (cons (::value state)
              (lazy-seq (seq-wrapper f (f state)))))))
 
-(defmacro state-machine [& body]
+(defn task-wrapper
+  "State machine wrapper that uses the async library"
+  ([f]
+     (let [p (promise)]
+       (task-wrapper f p (f))
+       p))
+  ([f p state]
+     (let [value (::value state)]
+       (println value (finished? state))
+       (cond
+        (finished? state)
+        (p value)
+        
+        (instance? ListenableFuture value)
+        (Futures/addCallback value
+                             (reify
+                               FutureCallback
+                               (onSuccess [this result]
+                                 (task-wrapper f p (-> state
+                                                       (assoc ::value result)
+                                                       f)))
+                               (onFailure [this ex]
+                                 (println "failure!")))
+                             *ambient-executor*)
+        
+        (instance? clojure.lang.IDeref value)
+        (recur f p (-> state
+                       (assoc ::value @value)
+                       f))
+        
+        :else
+        (throw (Exception. "Can't deref something that doesn't implement IDeref or ListenableFuture"))))))
+
+(defn state-machine [body]
   (-> (parse-to-state-machine body)
       second
       emit-state-machine
       debug))
 
+(defmacro async [& body]
+  (binding [*symbol-translations* '{clojure.core/deref async_tests/pause}]
+    `(task-wrapper ~(state-machine body))))
+
 (defn -main []
-  (-> (state-machine (let* [x (inc (yield 1))
-                            y (yield 1)]
-                           (yield (+ x y))))
-      runner-wrapper
-      #_doall
-      debug)
+  #_(-> (state-machine (let* [x (inc (yield 1))
+                              y (yield 1)]
+                             (yield (+ x y))))
+        runner-wrapper
+        #_doall
+        debug)
   #_[1 1]
   #_(assert (= (-> (state-machine (if (yield false)
                                     (yield true)
@@ -472,13 +548,13 @@
                     debug)))
 
   #_(assert (= (->> (state-machine (let [foo (yield 42)
-                                       bar (yield 43)
-                                       foo-fn (fn [] foo)
-                                       bar-fn (fn [] bar)]
-                                   (yield (foo-fn))
-                                   (yield (bar-fn))))
-                  debug
-                  
+                                         bar (yield 43)
+                                         foo-fn (fn [] foo)
+                                         bar-fn (fn [] bar)]
+                                     (yield (foo-fn))
+                                     (yield (bar-fn))))
+                    debug
+                    
                     state-machine-seq
                     (take 32)
                     doall
@@ -486,14 +562,34 @@
 
   (def ^:dynamic temp 0)
   #_(assert (= (->> (binding
-                      [temp 42]
-                    (state-machine (yield temp)
-                                   (yield temp)))
-                  state-machine-seq
-                  (take 32)
-                  doall
-                  debug)))
+                        [temp 42]
+                      (state-machine (yield temp)
+                                     (yield temp)))
+                    state-machine-seq
+                    (take 32)
+                    doall
+                    debug)))
 
+  (println @(async (do @(defer 42)
+                       @(defer 33))))
+
+  (defn thread-id []
+    (.getId (Thread/currentThread)))
+  
+  #_(->> (async (do (println @(defer (thread-id)))
+                    (println @(defer (thread-id)))
+                    (println (yield (defer (thread-id))))
+                    (println (yield (defer (thread-id))))
+                    (println (yield (defer (thread-id))))
+                    
+                    ))
+         task-wrapper
+         debug
+         deref
+         debug)
+
+
+  (.shutdownNow *ambient-executor*)
   
   )
 
