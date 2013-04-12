@@ -46,3 +46,14 @@ Async example:
                @(async {:a @(defer 42)
                         :b @(atom 43)})))))
 
+
+For more examples/tests, see core.clj
+
+
+# What doesn't work
+
+*   There's an odd race condition with the tasks, not sure why
+*   try/catch/finally inside an async block. This is rather hard to implement, and I haven't thought enough about it yet.
+
+
+
