@@ -164,7 +164,7 @@
 
 (defrecord Const [value]
   IInstruction
-  (reads-from [this] [])
+  (reads-from [this] [value])
   (writes-to [this] [(:id this)])
   (block-references [this] [])
   (emit-instruction [this state-sym]
@@ -286,7 +286,8 @@
         syms (map first parted)
         inits (map second parted)]
     (gen-plan
-     [local-ids (all (map item-to-ssa inits))
+     [local-val-ids (all (map item-to-ssa inits))
+      local-ids (all (map (comp add-instruction ->Const) local-val-ids))
       body-blk (add-block)
       final-blk (add-block)
       _ (add-instruction (->Jmp nil body-blk))
@@ -537,14 +538,16 @@
         #_doall
         debug)
   #_[1 1]
-  (println (generator (if (yield false)
+  #_(println (generator (if (yield false)
                         (yield true)
                         (yield false))))
+
+  (println (generator (loop [x 0]
+                        (if (< x 100)
+                          (recur (inc (yield x)))
+                          x))))
   
-  #_(assert (= (-> (state-machine (loop [x 0]
-                                    (if (< x 10)
-                                      (recur (inc (yield x)))
-                                      x)))
+  #_(assert (= (-> 
                    state-machine-seq
                    doall
                    debug)))
