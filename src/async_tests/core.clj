@@ -412,9 +412,37 @@
       debug))
 
 
-(defn- build-block-preamble [state-sym blk]
+(defn index-instruction [blk-id idx inst]
+  (let [idx (reduce
+             (fn [acc id]
+               (update-in acc [id :read-in] (fnil conj #{}) blk-id))
+             idx
+             (filter instruction? (reads-from inst)))
+        idx (reduce
+             (fn [acc id]
+               (update-in acc [id :written-in] (fnil conj #{}) blk-id))
+             idx
+             (filter instruction? (writes-to inst)))]
+    idx))
+
+(defn index-block [idx [blk-id blk]]
+  (reduce (partial index-instruction blk-id) idx blk))
+
+(defn index-state-machine [machine]
+  (reduce index-block {} (:blocks machine)))
+
+(defn persistent-value?
+  "Returns true if this value should be saved in the state hash map"
+  [index value]
+  (or (not= (-> index value :read-in)
+            (-> index value :written-in))
+      (-> index value :read-in count (> 1))))
+
+
+(defn- build-block-preamble [idx state-sym blk]
   (let [args (->> (mapcat reads-from blk)
                   (filter instruction?)
+                  (filter (partial persistent-value? idx))
                   set
                   vec)]
     (if (empty? args)
@@ -426,10 +454,11 @@
    #(emit-instruction % state-sym)
    (butlast blk)))
 
-(defn- build-new-state [state-sym blk]
+(defn- build-new-state [idx state-sym blk]
   (let [results (->> blk
                      (mapcat writes-to)
                      (filter instruction?)
+                     (filter (partial persistent-value? idx))
                      set
                      vec)
         results (interleave (map keyword results) results)]
@@ -438,7 +467,9 @@
       state-sym)))
 
 (defn- emit-state-machine [machine]
-  (let [state-sym (gensym "state_")]
+  (let [index (index-state-machine machine)
+        state-sym (gensym "state_")]
+    (pprint index)
     `(let [bindings# (get-thread-bindings)]
        (fn state-machine#
          ([]
@@ -453,12 +484,11 @@
                   ~@(mapcat
                      (fn [[id blk]]
                        `(~(keyword id)
-                         (let [~@(concat (build-block-preamble state-sym blk)
+                         (let [~@(concat (build-block-preamble index state-sym blk)
                                          (build-block-body state-sym blk))
-                               ~state-sym ~(build-new-state state-sym blk)]
+                               ~state-sym ~(build-new-state index state-sym blk)]
                            ~(emit-instruction (last blk) state-sym))))
                      (:blocks machine))))))))))
-
 
 (defn finished?
   "Returns true if the machine is in a finished state"
