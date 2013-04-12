@@ -135,10 +135,15 @@
           (no-op))]
      blk-sym)))
 
+
+(defn instruction? [x]
+  (::instruction (meta x)))
+
 (defn add-instruction
   "Appends an instruction to the current block. "
   [inst]
-  (let [inst-id (gensym "inst_")
+  (let [inst-id (with-meta (gensym "inst_")
+                  {::instruction true})
         inst (assoc inst :id inst-id)]
     (gen-plan
      [blk-id (get-block)
@@ -377,7 +382,9 @@
 
 (defmethod -item-to-ssa :default
   [x]
-  (gen-plan
+  (fn [plan]
+    [x plan])
+  #_(gen-plan
    [itm-id (add-instruction (->Const x))]
    itm-id))
 
@@ -388,7 +395,9 @@
     inst-id (if (contains? locals x)
               (fn [p]
                 [(locals x) p])
-              (add-instruction (->Const x)))]
+              (fn [p]
+                [x p])
+              #_(add-instruction (->Const x)))]
    inst-id))
 
 (defn parse-to-state-machine [body]
@@ -404,7 +413,7 @@
 
 (defn- build-block-preamble [state-sym blk]
   (let [args (->> (mapcat reads-from blk)
-                  (filter symbol?)
+                  (filter instruction?)
                   set
                   vec)]
     (if (empty? args)
@@ -419,6 +428,7 @@
 (defn- build-new-state [state-sym blk]
   (let [results (->> blk
                      (mapcat writes-to)
+                     (filter instruction?)
                      set
                      vec)
         results (interleave (map keyword results) results)]
@@ -489,6 +499,7 @@
                              (reify
                                FutureCallback
                                (onSuccess [this result]
+                                 (println "result----> " result @value)
                                  (task-wrapper f p (-> state
                                                        (assoc ::value result)
                                                        f)))
@@ -514,6 +525,10 @@
   (binding [*symbol-translations* '{clojure.core/deref async_tests/pause}]
     `(task-wrapper ~(state-machine body))))
 
+(defmacro generator [& body]
+  (binding [*symbol-translations* '{yield async_tests/pause}]
+    `(seq-wrapper ~(state-machine body))))
+
 (defn -main []
   #_(-> (state-machine (let* [x (inc (yield 1))
                               y (yield 1)]
@@ -522,12 +537,9 @@
         #_doall
         debug)
   #_[1 1]
-  #_(assert (= (-> (state-machine (if (yield false)
-                                    (yield true)
-                                    (yield false)))
-                   state-machine-seq
-                   doall
-                   debug)))
+  (println (generator (if (yield false)
+                        (yield true)
+                        (yield false))))
   
   #_(assert (= (-> (state-machine (loop [x 0]
                                     (if (< x 10)
@@ -570,8 +582,10 @@
                     doall
                     debug)))
 
-  (println @(async (do @(defer 42)
-                       @(defer 33))))
+  #_(println @(async (do (println @(defer 42))
+                       (println @(defer 33)))))
+
+  (println )
 
   (defn thread-id []
     (.getId (Thread/currentThread)))
